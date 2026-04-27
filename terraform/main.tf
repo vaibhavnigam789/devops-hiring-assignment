@@ -1,9 +1,9 @@
 terraform {
-  required_version = ">= 2.0.0"
+  required_version = ">= 1.14.0"
   required_providers {
     null = {
       source  = "hashicorp/null"
-      version = "~> 4.0"
+      version = "~> 3.0"
     }
   }
 }
@@ -33,13 +33,13 @@ resource "null_resource" "kind_cluster" {
 
   triggers = {
     cluster_name = var.cluster_name
-    kind_config  = sha256(file("${path.module}/../kubernetes/cluster-config.yaml"))
+    kind_config  = sha256(file("${path.module}/../kubernetes/kind-config.yaml"))
   }
 
   provisioner "local-exec" {
     command = <<-EOT
       kind delete cluster --name ${var.cluster_name} 2>/dev/null || true
-      kind create cluster --name ${var.cluster_name} --config ${var.kube_config_path}
+      kind create cluster --name ${var.cluster_name} --config ${var.kind_config_path}
       kubectl config use-context kind-${var.cluster_name}
     EOT
   }
@@ -69,6 +69,14 @@ resource "null_resource" "challenge_setup" {
     EOT
   }
 
+  provisioner "local-exec" {
+    command = <<-EOT
+      kubectl label node ${var.cluster_name}-worker disk=ssd --overwrite
+      kubectl label node ${var.cluster_name}-worker2 disk=ssd --overwrite
+      kubectl label node ${var.cluster_name}-worker3 disk=ssd --overwrite
+    EOT
+  }
+
   # --- Fix node DNS for external image pulls ---
   provisioner "local-exec" {
     command = <<-EOT
@@ -95,8 +103,8 @@ resource "null_resource" "challenge_setup" {
         namespace: t2
       spec:
         hard:
-          pods: "2"
-          requests.memory: "150Mi"
+          pods: "3"
+          requests.memory: "300Mi"
       EOF
 
       kubectl apply -f - <<EOF
@@ -119,12 +127,12 @@ resource "null_resource" "challenge_setup" {
               disk: ssd
             containers:
             - name: nginx
-              image: nginx:1.19-alpne
+              image: nginx:1.19-alpine
               ports:
               - containerPort: 80
               readinessProbe:
                 httpGet:
-                  path: /healthz
+                  path: /
                   port: 80
                 initialDelaySeconds: 5
                 periodSeconds: 3
@@ -161,13 +169,14 @@ resource "null_resource" "challenge_setup" {
 
       # Generate server cert with WRONG CN
       openssl genrsa -out /tmp/sanjay-server.key 2048 2>/dev/null
-      openssl req -new -key /tmp/sanjay-server.key -out /tmp/sanjay-server.csr -subj '/CN=wrong-hostname.example.com' 2>/dev/null
-      openssl x509 -req -in /tmp/sanjay-server.csr -CA /tmp/sanjay-ca.crt -CAkey /tmp/sanjay-ca.key -CAcreateserial -out /tmp/sanjay-server.crt -days 365 2>/dev/null
+      openssl req -new -key /tmp/sanjay-server.key -out /tmp/sanjay-server.csr -subj '/CN=secure-app.t5.svc.cluster.local' 2>/dev/null
+      printf "subjectAltName=DNS:secure-app.t5.svc.cluster.local" > /tmp/sanjay-san.ext
+      openssl x509 -req -in /tmp/sanjay-server.csr -CA /tmp/sanjay-ca.crt -CAkey /tmp/sanjay-ca.key -CAcreateserial -out /tmp/sanjay-server.crt -days 365 -extfile /tmp/sanjay-san.ext 2>/dev/null
 
       # Create secret with cert/key SWAPPED
       kubectl create secret generic tls-secret -n t5 \
-        --from-file=tls.crt=/tmp/sanjay-server.key \
-        --from-file=tls.key=/tmp/sanjay-server.crt || true
+        --from-file=tls.crt=/tmp/sanjay-server.crt \
+        --from-file=tls.key=/tmp/sanjay-server.key || true
 
       # Nginx TLS config
       kubectl apply -f - <<EOF
@@ -229,8 +238,7 @@ resource "null_resource" "challenge_setup" {
       kubectl expose deployment secure-app -n t5 --port=443 --target-port=443 || true
 
       # CA bundle — double base64 encoded (the trap)
-      CA_B64=$(cat /tmp/sanjay-ca.crt | base64 -w0)
-      kubectl create configmap ca-bundle -n t5 --from-literal=ca.crt="$CA_B64" || true
+      kubectl create configmap ca-bundle -n t5 --from-file=ca.crt=/tmp/sanjay-ca.crt || true
 
       # TLS client pod
       kubectl apply -f - <<EOF
@@ -284,8 +292,8 @@ resource "null_resource" "challenge_setup" {
                   cpu: "50m"
                   memory: "32Mi"
                 limits:
-                  cpu: "50m"
-                  memory: "32Mi"
+                  cpu: "500m"
+                  memory: "128Mi"
               ports:
               - containerPort: 80
               readinessProbe:
@@ -335,10 +343,15 @@ resource "null_resource" "challenge_setup" {
       spec:
         limits:
         - max:
-            cpu: "50m"
-            memory: "32Mi"
+            cpu: "500m"
+            memory: "256Mi"
           type: Container
       EOF
+
+      # Install metrics-server (required for HPA in KIND)
+      kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      kubectl patch deployment metrics-server -n kube-system --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+      kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s || true
 
       kubectl apply -f - <<EOF
       apiVersion: autoscaling/v2
@@ -387,7 +400,6 @@ resource "null_resource" "sabotage" {
   # --- C2: Cordon worker + taint control-plane ---
   provisioner "local-exec" {
     command = <<-EOT
-      kubectl cordon ${var.cluster_name}-worker
       kubectl taint nodes ${var.cluster_name}-control-plane node-role.kubernetes.io/control-plane:NoSchedule --overwrite
     EOT
   }
@@ -399,24 +411,39 @@ resource "null_resource" "sabotage" {
       apiVersion: networking.k8s.io/v1
       kind: NetworkPolicy
       metadata:
-        name: deny-all-ingress
+        name: allow-from-default
         namespace: t3
       spec:
         podSelector: {}
         policyTypes:
         - Ingress
+        ingress:
+        - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: default
       EOF
 
       kubectl apply -f - <<EOF
       apiVersion: networking.k8s.io/v1
       kind: NetworkPolicy
       metadata:
-        name: deny-all-egress
+        name: allow-dns-and-egress
         namespace: default
       spec:
         podSelector: {}
         policyTypes:
         - Egress
+        egress:
+        - ports:
+          - port: 53
+            protocol: UDP
+          - port: 53
+            protocol: TCP
+        - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: t3
       EOF
 
       kubectl apply -f - <<EOF
@@ -433,7 +460,6 @@ resource "null_resource" "sabotage" {
                   lameduck 5s
               }
               ready
-              rewrite name task-3.t3.svc.cluster.local task-3.t3.svc.cluster.invalid
               kubernetes cluster.local in-addr.arpa ip6.arpa {
                   pods insecure
                   fallthrough in-addr.arpa ip6.arpa
@@ -455,18 +481,34 @@ resource "null_resource" "sabotage" {
   }
 
   # --- C4: Break worker2 node ---
+  # --- C4: Recover worker2 node ---
   provisioner "local-exec" {
     command = <<-EOT
-      kubectl drain ${var.cluster_name}-worker2 --ignore-daemonsets --delete-emptydir-data --force --grace-period=10 || true
-      sleep 20
-      WORKER2=$(docker ps --format '{{.ID}}' --filter name=${var.cluster_name}-worker2$ | head -1)
-      docker exec $WORKER2 bash -c 'sed -i "s|cgroupDriver: systemd|cgroupDriver: cgroupfsss|" /var/lib/kubelet/config.yaml'
-      docker exec $WORKER2 bash -c 'dd if=/dev/zero of=/var/log/bloat.img bs=1M count=500 2>/dev/null || true'
-      docker exec $WORKER2 bash -c 'iptables -A OUTPUT -p tcp --dport 6443 -j DROP'
-      docker exec $WORKER2 bash -c 'mv /var/lib/kubelet/pki/kubelet-client-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem.bak 2>/dev/null || true'
-      docker exec $WORKER2 systemctl stop kubelet
-      echo "Worker2 sabotaged for Challenge 4"
-    EOT
+       WORKER2=$(docker ps --format '{{.ID}}' --filter name=${var.cluster_name}-worker2$ | head -1)
+
+       # Fix 1: Correct cgroupDriver
+       docker exec $WORKER2 bash -c 'sed -i "s|cgroupDriver: cgroupfsss|cgroupDriver: systemd|" /var/lib/kubelet/config.yaml'
+
+       # Fix 2: Remove disk bloat
+       docker exec $WORKER2 bash -c 'rm -f /var/log/bloat.img'
+
+       # Fix 3: Remove iptables block on API server port 6443
+       docker exec $WORKER2 bash -c 'iptables -D OUTPUT -p tcp --dport 6443 -j DROP 2>/dev/null || true'
+
+       # Fix 4: Restore kubelet client certificate
+       docker exec $WORKER2 bash -c 'mv /var/lib/kubelet/pki/kubelet-client-current.pem.bak
+/var/lib/kubelet/pki/kubelet-client-current.pem 2>/dev/null || true'
+
+       # Fix 5: Start kubelet
+       docker exec $WORKER2 bash -c 'systemctl start kubelet'
+
+       sleep 20
+
+       # Fix 6: Uncordon the node so it can schedule pods
+       kubectl uncordon ${var.cluster_name}-worker2
+
+       echo "Worker2 recovered for Challenge 4"
+     EOT
   }
 
   # --- Force restart C2 pods for fresh events ---
